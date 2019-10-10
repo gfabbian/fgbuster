@@ -359,13 +359,15 @@ def multi_res_comp_sep(components, instrument, data, nsides, **minimize_kwargs):
     if max_nside == 0:
         return basic_comp_sep(components, instrument, data, **minimize_kwargs)
 
-    unpack = lambda x: [_my_ud_grade(m, max_nside).reshape(-1, 1, 1, 1)
+    # unpack = lambda x: [_my_ud_grade(m, max_nside).reshape(-1, 1, 1, 1)
+    unpack = lambda x: [_my_ud_grade(m, max_nside).reshape(-1, 1, 1)
                         for m in array2maps(x)]
 
     # Traspose the the data and put the pixels that share the same spectral
     # indices next to each other
     n_pix_max_nside = hp.nside2npix(max_nside)
     pix_ids = np.argsort(hp.ud_grade(np.arange(n_pix_max_nside), data_nside))
+
     data = data.T[pix_ids].reshape(
         n_pix_max_nside, (data_nside / max_nside)**2, *data.T.shape[1:])
 
@@ -402,10 +404,15 @@ def multi_res_comp_sep(components, instrument, data, nsides, **minimize_kwargs):
             res.chi_dB[i] = restore_index_mask_transpose(res.chi_dB[i])
 
     if len(x0):
+        print nsides
+        print '----'
         x_masks = [_my_ud_grade(mask.astype(float), nside) == 1.
                    for nside in nsides]
         res.x = array2maps(res.x)
         for x, x_mask in zip(res.x, x_masks):
+            print x
+            print x_mask
+
             x[x_mask] = hp.UNSEEN
 
     res.mask_good = ~mask
@@ -502,7 +509,7 @@ def _my_ud_grade(map_in, nside_out, **kwargs):
             out[np.where(ids == 0)[0][:12]] = map_in
             kwargs['pess'] = False
             res = hp.ud_grade(out, 1, **kwargs)
-            return np.array([res])
+            return np.array([res[0]])
     try:
         return hp.ud_grade(np.full(12, float(map_in)), nside_out, **kwargs)
     except TypeError:
