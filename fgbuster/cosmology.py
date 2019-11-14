@@ -21,10 +21,12 @@ import numpy as np
 import pylab as pl
 import healpy as hp
 import scipy as sp
-from .algebra import comp_sep, W_dBdB, W_dB, W, _mmm, _utmv, _mmv
-from .mixingmatrix import MixingMatrix
-from .separation_recipies import _force_keys_as_attributes
-
+# from .algebra import comp_sep, W_dBdB, W_dB, W, _mmm, _utmv, _mmv
+# from .mixingmatrix import MixingMatrix
+# from .separation_recipies import _force_keys_as_attributes
+from fgbuster.algebra import comp_sep, W_dBdB, W_dB, W, _mmm, _utmv, _mmv
+from fgbuster.mixingmatrix import MixingMatrix
+from fgbuster.separation_recipies import _force_keys_as_attributes
 
 __all__ = [
     'xForecast',
@@ -36,7 +38,7 @@ CMB_CL_FILE = op.join(
 
 
 def xForecast(components, instrument, d_fgs, lmin, lmax,
-              Alens=1.0, r=0.001, make_figure=False,
+              Alens=1.0, r=0.001, make_figure=False, multipatch_nside=0,
               **minimize_kwargs):
     """ xForecast
 
@@ -103,18 +105,30 @@ def xForecast(components, instrument, d_fgs, lmin, lmax,
     # Preliminaries
     instrument = _force_keys_as_attributes(instrument)
     nside = hp.npix2nside(d_fgs.shape[-1])
-    n_stokes = d_fgs.shape[1]
-    n_freqs = d_fgs.shape[0]
+
     invN = np.diag(hp.nside2resol(nside, arcmin=True) / (instrument.Sens_P))**2
     mask = d_fgs[0, 0, :] != 0.
     fsky = mask.astype(float).sum() / mask.size
-    ell = np.arange(lmin, lmax+1)
     print('fsky = ', fsky)
 
+    Cl_fgs = cls_computation(d_fgs, fsky, lmin, lmax)
+
+    res = spectral_likelihood(components, instrument, d_fgs, invN, **minimize_kwargs)
+
+    res, Cl_xF = residuals_computation(res, Cl_fgs, instrument, components, invN,
+                lmin, lmax, multipatch_nside=multipatch_nside)
+
+    res = cosmo_analysis(res, Cl_xF, lmin, lmax, Alens, r, fsky, 
+                make_figure=make_figure, **minimize_kwargs)
+
+    return res
+
+def spectral_likelihood(components, instrument, d_fgs, invN, **minimize_kwargs):
     ############################################################################
     # 1. Component separation using the noise-free foregrounds templare
     # grab the max-L spectra parameters with the associated error bars
     print('======= ESTIMATION OF SPECTRAL PARAMETERS =======')
+    n_stokes = d_fgs.shape[1]
     A = MixingMatrix(*components)
     A_ev = A.evaluator(instrument.Frequencies)
     A_dB_ev = A.diff_evaluator(instrument.Frequencies)
@@ -129,24 +143,17 @@ def xForecast(components, instrument, d_fgs, lmin, lmax,
                    **minimize_kwargs)
 
     res.params = A.params
-    res.s = res.s.T
-    A_maxL = A_ev(res.x)
-    A_dB_maxL = A_dB_ev(res.x)
-    A_dBdB_maxL = A.diff_diff_evaluator(instrument.Frequencies)(res.x)
 
-    print('res.x = ', res.x)
+    return res
 
+def cls_computation(d_fgs, fsky, lmin, lmax):
     ############################################################################
-    # 2. Estimate noise after component separation
-    ### A^T N_ell^-1 A
-    print('======= ESTIMATION OF NOISE AFTER COMP SEP =======')
-    i_cmb = A.components.index('CMB')
-    Cl_noise = _get_Cl_noise(instrument, A_maxL, lmax)[i_cmb, i_cmb, lmin:]
-
-    ############################################################################
-    # 3. Compute spectra of the input foregrounds maps
+    # 2. Compute spectra of the input foregrounds maps
     ### TO DO: which size for Cl_fgs??? N_spec != 1 ? 
     print ('======= COMPUTATION OF CL_FGS =======')
+    n_freqs = d_fgs.shape[0]
+    n_stokes = d_fgs.shape[1]
+
     if n_stokes == 3:  
         d_spectra = d_fgs
     else:  # Only P is provided, add T for map2alm
@@ -164,6 +171,29 @@ def xForecast(components, instrument, d_fgs, lmin, lmax,
                 Cl_fgs[f1, f2] = hp.alm2cl(almBs[f1], almBs[f2], lmax=lmax)
 
     Cl_fgs = Cl_fgs[..., lmin:] / fsky
+
+    return Cl_fgs
+
+def residuals_computation(res, Cl_fgs, instrument, components, invN,
+                lmin, lmax, multipatch_nside=0):
+
+    n_freqs = Cl_fgs.shape[0]
+
+    A = MixingMatrix(*components)
+    A_ev = A.evaluator(instrument.Frequencies)
+    A_dB_ev = A.diff_evaluator(instrument.Frequencies)
+
+    res.s = res.s.T
+    A_maxL = A_ev(res.x)
+    A_dB_maxL = A_dB_ev(res.x)
+    A_dBdB_maxL = A.diff_diff_evaluator(instrument.Frequencies)(res.x)
+
+    ############################################################################
+    # 3. Estimate noise after component separation
+    ### A^T N_ell^-1 A
+    print('======= ESTIMATION OF NOISE AFTER COMP SEP =======')
+    i_cmb = A.components.index('CMB')
+    Cl_noise = _get_Cl_noise(instrument, A_maxL, lmax)[i_cmb, i_cmb, lmin:]
 
     ############################################################################
     # 4. Estimate the statistical and systematic foregrounds residuals
@@ -196,6 +226,13 @@ def xForecast(components, instrument, d_fgs, lmin, lmax,
     res.var = res.stat**2 + 2 * np.einsum('li, ij, lj -> l', # S16, Eq. 28
                                           Cl_xF['Yy'], res.Sigma, Cl_xF['Yy'])
 
+    return res, Cl_xF
+
+def cosmo_analysis(res, Cl_xF, lmin, lmax, Alens, r, fsky, 
+                make_figure=False, **minimize_kwargs):
+
+    ell = np.arange(lmin, lmax+1)
+
     ###############################################################################
     # 5. Plug into the cosmological likelihood
     print ('======= OPTIMIZATION OF COSMO LIKELIHOOD =======')
@@ -227,7 +264,7 @@ def xForecast(components, instrument, d_fgs, lmin, lmax,
         ax.set_xlim(lmin,lmax)
 
     ## 5.1. data 
-    Cl_obs = Cl_fid['BB'] + Cl_noise
+    Cl_obs = Cl_fid['BB'] + res.noise
     dof = (2 * ell + 1) * fsky
     YY = Cl_xF['YY']
     tr_SigmaYY = np.einsum('ij, lji -> l', res.Sigma, YY)
@@ -235,7 +272,7 @@ def xForecast(components, instrument, d_fgs, lmin, lmax,
     ## 5.2. modeling
     def cosmo_likelihood(r_):
         # S16, Appendix C
-        Cl_model = Cl_fid['BlBl'] * Alens + Cl_fid['BuBu'] * r_ + Cl_noise
+        Cl_model = Cl_fid['BlBl'] * Alens + Cl_fid['BuBu'] * r_ + res.noise
         dof_over_Cl = dof / Cl_model
         ## Eq. C3
         U = np.linalg.inv(res.Sigma_inv + np.dot(YY.T, dof_over_Cl))
