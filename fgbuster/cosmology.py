@@ -27,6 +27,7 @@ import scipy as sp
 from fgbuster.algebra import comp_sep, W_dBdB, W_dB, W, _mmm, _utmv, _mmv
 from fgbuster.mixingmatrix import MixingMatrix
 from fgbuster.separation_recipies import _force_keys_as_attributes
+from scipy.ndimage import gaussian_filter1d
 
 __all__ = [
     'xForecast',
@@ -178,6 +179,7 @@ def residuals_computation(res, Cl_fgs, instrument, components, invN,
                 lmin, lmax, multipatch_nside=0):
 
     n_freqs = Cl_fgs.shape[0]
+    ell = np.arange(lmin, lmax+1)
 
     A = MixingMatrix(*components)
     A_ev = A.evaluator(instrument.Frequencies)
@@ -213,11 +215,20 @@ def residuals_computation(res, Cl_fgs, instrument, components, invN,
 
     # elementary quantities defined in Stompor, Errard, Poletti (2016)
     Cl_xF = {}
+    Cl_xF['ell'] = ell
+
+    print res.Sigma
+    if multipatch_nside != 0:
+        print('MULTIPATCH MODE')
+        res, Cl_xF, Cl_fgs_smooth  = multipatch_transform(res, Cl_xF, Cl_fgs, multipatch_nside)
+    else:
+        Cl_fgs_smooth = Cl_fgs*1.0
+
     Cl_xF['yy'] = _utmv(W_maxL, Cl_fgs.T, W_maxL)  # (ell,)
-    Cl_xF['YY'] = _mmm(W_dB_maxL, Cl_fgs.T, W_dB_maxL.T)  # (ell, param, param)
+    Cl_xF['YY'] = _mmm(W_dB_maxL, Cl_fgs_smooth.T, W_dB_maxL.T)  # (ell, param, param)
     Cl_xF['yz'] = _utmv(W_maxL, Cl_fgs.T, V_maxL )  # (ell,)
-    Cl_xF['Yy'] = _mmv(W_dB_maxL, Cl_fgs.T, W_maxL)  # (ell, param)
-    Cl_xF['Yz'] = _mmv(W_dB_maxL, Cl_fgs.T, V_maxL)  # (ell, param)
+    Cl_xF['Yy'] = _mmv(W_dB_maxL, Cl_fgs_smooth.T, W_maxL)  # (ell, param)
+    Cl_xF['Yz'] = _mmv(W_dB_maxL, Cl_fgs_smooth.T, V_maxL)  # (ell, param)
 
     # bias and statistical foregrounds residuals
     res.noise = Cl_noise
@@ -231,8 +242,6 @@ def residuals_computation(res, Cl_fgs, instrument, components, invN,
 def cosmo_analysis(res, Cl_xF, lmin, lmax, Alens, r, fsky, 
                 make_figure=False, **minimize_kwargs):
 
-    ell = np.arange(lmin, lmax+1)
-
     ###############################################################################
     # 5. Plug into the cosmological likelihood
     print ('======= OPTIMIZATION OF COSMO LIKELIHOOD =======')
@@ -244,7 +253,7 @@ def cosmo_analysis(res, Cl_xF, lmin, lmax, Alens, r, fsky,
     res.BB = Cl_fid['BB']*1.0
     res.BuBu = Cl_fid['BuBu']*1.0
     res.BlBl = Cl_fid['BlBl']*1.0
-    res.ell = ell
+    res.ell = Cl_xF['ell']
     if make_figure:
         fig = pl.figure( figsize=(14,12), facecolor='w', edgecolor='k' )
         ax = pl.gca()
@@ -253,11 +262,11 @@ def cosmo_analysis(res, Cl_xF, lmin, lmax, Alens, r, fsky,
         ax0.set_title(r'$\ell_{\min}=$'+str(lmin)+\
             r'$ \rightarrow \ell_{\max}=$'+str(lmax), fontsize=16)
 
-        ax.loglog(ell, Cl_fid['BB'], color='DarkGray', linestyle='-', label='BB tot', linewidth=2.0)
-        ax.loglog(ell, Cl_fid['BuBu']*r , color='DarkGray', linestyle='--', label='primordial BB for r='+str(r), linewidth=2.0)
-        ax.loglog(ell, res.stat, 'DarkOrange', label='statistical residuals', linewidth=2.0)
-        ax.loglog(ell, res.bias, 'DarkOrange', linestyle='--', label='systematic residuals', linewidth=2.0)
-        ax.loglog(ell, res.noise, 'DarkBlue', linestyle='--', label='noise after component separation', linewidth=2.0)
+        ax.loglog(res.ell, Cl_fid['BB'], color='DarkGray', linestyle='-', label='BB tot', linewidth=2.0)
+        ax.loglog(res.ell, Cl_fid['BuBu']*r , color='DarkGray', linestyle='--', label='primordial BB for r='+str(r), linewidth=2.0)
+        ax.loglog(res.ell, res.stat, 'DarkOrange', label='statistical residuals', linewidth=2.0)
+        ax.loglog(res.ell, res.bias, 'DarkOrange', linestyle='--', label='systematic residuals', linewidth=2.0)
+        ax.loglog(res.ell, res.noise, 'DarkBlue', linestyle='--', label='noise after component separation', linewidth=2.0)
         ax.legend()
         ax.set_xlabel('$\ell$', fontsize=20)
         ax.set_ylabel('$C_\ell$ [$\mu$K-arcmin]', fontsize=20)
@@ -265,7 +274,7 @@ def cosmo_analysis(res, Cl_xF, lmin, lmax, Alens, r, fsky,
 
     ## 5.1. data 
     Cl_obs = Cl_fid['BB'] + res.noise
-    dof = (2 * ell + 1) * fsky
+    dof = (2 * res.ell + 1) * fsky
     YY = Cl_xF['YY']
     tr_SigmaYY = np.einsum('ij, lji -> l', res.Sigma, YY)
 
@@ -400,3 +409,27 @@ def _get_Cl_noise(instrument, A, lmax):
     AtNA = np.einsum('fi, fl, fj -> lij', A, nl, A)
     inv_AtNA = np.linalg.inv(AtNA)
     return inv_AtNA.swapaxes(-3, -1)
+
+
+def multipatch_transform(res, Cl_xF, Cl_fgs, multipatch_nside=0):
+    '''
+    produce multipatch statistical residuals which look like
+    the expected ones given the multipatch nside (see Errard and Stompor 2019)
+    from the full sky residuals and full sky Sigma
+    '''
+    Npatches = 12*multipatch_nside**2
+    # boosting Sigma by the number of independent patches
+    res.Sigma *= Npatches
+    # keep the ells above the size patch
+    ell_patch = np.pi/hp.nside2resol(multipatch_nside)
+    Cl_fgs_ = Cl_fgs*1.0
+    Cl_fgs_[:,:,int(ell_patch)-2:] = Cl_fgs[:,:,int(ell_patch)-2:]
+    # for the low ell part, build a power law with an end matching 
+    # the high part
+    Cl_fgs_[:,:,:int(ell_patch)-2] = Cl_fgs_[:,:,int(ell_patch)-2,np.newaxis]
+    # smoothing the curve with a Gaussian filter
+    Cl_fgs = gaussian_filter1d( Cl_fgs_, 5 )
+
+    return res, Cl_xF, Cl_fgs
+
+
